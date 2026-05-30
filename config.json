@@ -1,0 +1,7 @@
+{
+  "password": "changeme",
+  "host": "0.0.0.0",
+  "port": 5009,
+  "lru_size": 256,
+  "secret_key": "please-change-this-random-string"
+}

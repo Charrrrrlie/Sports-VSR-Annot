@@ -1,0 +1,528 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>视频关键帧标注</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+           "Helvetica Neue", Arial, sans-serif;
+    background: #f3f4f6; color: #111827;
+  }
+  body.keyframe { background: #fef9c3; }
+  header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 10px 16px; background: #1f2937; color: #f9fafb;
+  }
+  header select, header input[type=number] {
+    padding: 4px 8px; font-size: 13px; border-radius: 4px; border: 1px solid #4b5563;
+    background: #374151; color: #f9fafb;
+  }
+  #counter { font-size: 14px; font-variant-numeric: tabular-nums; }
+  #counter b { font-size: 15px; }
+  #kf-badge {
+    display: none; margin-left: 8px;
+    padding: 2px 8px; border-radius: 4px;
+    background: #dc2626; color: #fff; font-weight: 700; font-size: 12px;
+    letter-spacing: 0.5px;
+  }
+  body.keyframe #kf-badge { display: inline-block; }
+  header .spacer { flex: 1; }
+  header a { color: #d1d5db; font-size: 12px; text-decoration: none; }
+  header a:hover { color: #fff; }
+
+  main {
+    display: grid; grid-template-columns: 1fr 280px;
+    gap: 16px; padding: 16px; height: calc(100vh - 48px);
+  }
+  .viewer {
+    display: flex; flex-direction: column; gap: 12px;
+    min-width: 0;
+  }
+  .frame-wrap {
+    position: relative; flex: 1;
+    display: flex; align-items: center; justify-content: center;
+    background: #fff; border: 1px solid #d1d5db; border-radius: 6px;
+    overflow: hidden;
+    transition: border-color 0.12s, box-shadow 0.12s;
+  }
+  body.keyframe .frame-wrap {
+    border: 4px solid #f59e0b;
+    box-shadow: 0 0 0 2px #fde68a, 0 4px 16px rgba(245, 158, 11, 0.3);
+  }
+  .frame-wrap img {
+    max-width: 100%; max-height: 100%; object-fit: contain;
+    display: block;
+  }
+  #kf-overlay {
+    display: none; position: absolute; top: 10px; left: 10px;
+    background: #f59e0b; color: #1f2937; font-weight: 800;
+    padding: 6px 12px; border-radius: 4px;
+    font-size: 13px; letter-spacing: 1px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+  }
+  body.keyframe #kf-overlay { display: block; }
+
+  .controls {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+    padding: 8px; background: #fff;
+    border: 1px solid #d1d5db; border-radius: 6px;
+  }
+  .controls button {
+    padding: 6px 10px; font-size: 13px; cursor: pointer;
+    background: #fff; border: 1px solid #d1d5db; border-radius: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  .controls button:hover { background: #f3f4f6; }
+  .controls .jump { margin-left: auto; display: flex; gap: 4px; align-items: center; }
+  .controls .jump input { width: 80px; padding: 5px 8px; font-size: 13px;
+    border: 1px solid #d1d5db; border-radius: 4px; }
+
+  aside {
+    display: flex; flex-direction: column; gap: 12px;
+    min-height: 0;
+  }
+  .panel {
+    background: #fff; border: 1px solid #d1d5db; border-radius: 6px;
+    padding: 12px;
+  }
+  .panel h2 {
+    margin: 0 0 8px; font-size: 13px; text-transform: uppercase;
+    letter-spacing: 0.5px; color: #6b7280;
+  }
+  #persons label {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 4px; cursor: pointer; font-size: 14px;
+    border-radius: 4px;
+  }
+  #persons label:hover { background: #f3f4f6; }
+  #persons input { width: 16px; height: 16px; }
+  #persons .num {
+    color: #9ca3af; font-size: 11px; font-variant-numeric: tabular-nums;
+    margin-left: auto;
+  }
+
+  .kf-panel { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  #kf-list {
+    flex: 1; overflow-y: auto; margin: 0; padding: 0; list-style: none;
+    border: 1px solid #e5e7eb; border-radius: 4px;
+    font-variant-numeric: tabular-nums; font-size: 13px;
+  }
+  #kf-list li {
+    display: flex; align-items: center; gap: 6px;
+    padding: 6px 8px; border-bottom: 1px solid #f3f4f6;
+    cursor: pointer;
+  }
+  #kf-list li:hover { background: #f9fafb; }
+  #kf-list li.current {
+    background: #fef3c7; font-weight: 600;
+  }
+  #kf-list li .arrow { width: 14px; color: #f59e0b; }
+  #kf-list li.current .arrow::before { content: "▶"; }
+  #kf-list li .frame-no { color: #2563eb; min-width: 50px; }
+  #kf-list li .ids { color: #374151; flex: 1;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #kf-list li .del {
+    background: none; border: 0; color: #9ca3af; cursor: pointer;
+    font-size: 16px; padding: 0 4px;
+  }
+  #kf-list li .del:hover { color: #dc2626; }
+  #kf-list .empty { padding: 12px; text-align: center; color: #9ca3af; }
+
+  #status {
+    font-size: 12px; color: #6b7280; padding: 4px 8px;
+    min-height: 20px;
+  }
+  #status.saving { color: #2563eb; }
+  #status.saved { color: #16a34a; }
+  #status.error { color: #dc2626; }
+
+  .hint { font-size: 11px; color: #9ca3af; margin-top: 8px; line-height: 1.5; }
+  kbd {
+    background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 3px;
+    padding: 1px 4px; font-size: 10px; font-family: monospace;
+  }
+</style>
+</head>
+<body>
+<header>
+  <label>目录:
+    <select id="dir-select"></select>
+  </label>
+  <label>视频:
+    <select id="video-select"></select>
+  </label>
+  <span id="counter">Frame <b id="cur-frame">0</b> / <span id="total-frame">0</span></span>
+  <span id="kf-badge">★ KEYFRAME</span>
+  <span class="spacer"></span>
+  <span id="status"></span>
+  <a href="/logout">退出</a>
+</header>
+
+<main>
+  <section class="viewer">
+    <div class="frame-wrap">
+      <div id="kf-overlay">★ KEYFRAME</div>
+      <img id="frame-img" alt="">
+    </div>
+    <div class="controls">
+      <button data-step="first" title="首帧 (Home)">|&lt;</button>
+      <button data-step="-10" title="-10 (Ctrl+←)">-10</button>
+      <button data-step="-5"  title="-5 (Shift+←)">-5</button>
+      <button data-step="-1"  title="-1 (←)">-1</button>
+      <button data-step="+1"  title="+1 (→)">+1</button>
+      <button data-step="+5"  title="+5 (Shift+→)">+5</button>
+      <button data-step="+10" title="+10 (Ctrl+→)">+10</button>
+      <button data-step="last" title="末帧 (End)">&gt;|</button>
+      <span class="jump">
+        Jump:
+        <input type="number" id="jump-input" min="0" placeholder="帧号">
+        <button id="jump-btn">Go</button>
+      </span>
+    </div>
+  </section>
+
+  <aside>
+    <div class="panel">
+      <h2>Person IDs <span style="color:#9ca3af;font-weight:normal">(勾选即关键帧)</span></h2>
+      <div id="persons"></div>
+      <div class="hint">
+        快捷键: <kbd>←</kbd>/<kbd>→</kbd> ±1,
+        <kbd>Shift</kbd>+方向 ±5,
+        <kbd>Ctrl</kbd>+方向 ±10,
+        <kbd>Home</kbd>/<kbd>End</kbd> 首尾,
+        <kbd>1</kbd>-<kbd>9</kbd> 切换ID,
+        <kbd>Esc</kbd> 清空所有勾选
+      </div>
+    </div>
+    <div class="panel kf-panel">
+      <h2>Keyframes <span id="kf-count">(0)</span></h2>
+      <ul id="kf-list"><li class="empty">尚无关键帧</li></ul>
+    </div>
+  </aside>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const DIR_KEY = "annot.selectedDir";
+const VIDEO_KEY = "annot.selectedVideo";
+const ALL_DIRS = "__ALL__";
+const state = {
+  videos: [],           // [{name, dir, basename, frame_count, fps, ...}]
+  dir: ALL_DIRS,        // selected dir filter
+  current: null,        // video name (full relative path)
+  total: 0,
+  fps: 0,
+  frame: 0,             // current frame index
+  persons: [],          // global person id list
+  keyframes: [],        // [{frame, person_ids, updated_at}]
+  saveTimer: null,
+};
+
+// URL-encode a relative path one segment at a time so '/' stays as '/'
+function encName(name) {
+  return name.split("/").map(encodeURIComponent).join("/");
+}
+
+async function jget(url) {
+  const r = await fetch(url, { credentials: "same-origin" });
+  if (r.status === 401) { location.href = "/login"; throw new Error("auth"); }
+  if (!r.ok) throw new Error(r.statusText);
+  return r.json();
+}
+async function jpost(url, body) {
+  const r = await fetch(url, {
+    method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  if (r.status === 401) { location.href = "/login"; throw new Error("auth"); }
+  if (!r.ok) throw new Error(r.statusText);
+  return r.json();
+}
+
+function setStatus(text, cls) {
+  const el = $("#status");
+  el.textContent = text || "";
+  el.className = cls || "";
+}
+
+function findKf(frame) {
+  return state.keyframes.find((k) => k.frame === frame);
+}
+
+function isKeyframe(frame) {
+  return !!findKf(frame);
+}
+
+function refreshKfUI() {
+  const kf = findKf(state.frame);
+  document.body.classList.toggle("keyframe", !!kf);
+  // sync checkboxes
+  const ids = kf ? new Set(kf.person_ids) : new Set();
+  for (const cb of document.querySelectorAll("#persons input[type=checkbox]")) {
+    cb.checked = ids.has(cb.value);
+  }
+}
+
+function renderKfList() {
+  const list = $("#kf-list");
+  $("#kf-count").textContent = `(${state.keyframes.length})`;
+  if (state.keyframes.length === 0) {
+    list.innerHTML = '<li class="empty">尚无关键帧</li>';
+    return;
+  }
+  list.innerHTML = "";
+  for (const kf of state.keyframes) {
+    const li = document.createElement("li");
+    if (kf.frame === state.frame) li.className = "current";
+    li.innerHTML = `
+      <span class="arrow"></span>
+      <span class="frame-no">${kf.frame}</span>
+      <span class="ids" title="${kf.person_ids.join(", ")}">${kf.person_ids.join(", ")}</span>
+      <button class="del" title="删除">×</button>
+    `;
+    li.addEventListener("click", (e) => {
+      if (e.target.classList.contains("del")) return;
+      goto(kf.frame);
+    });
+    li.querySelector(".del").addEventListener("click", (e) => {
+      e.stopPropagation();
+      state.keyframes = state.keyframes.filter((k) => k.frame !== kf.frame);
+      renderKfList();
+      if (kf.frame === state.frame) refreshKfUI();
+      scheduleSave();
+    });
+    list.appendChild(li);
+  }
+}
+
+function renderPersons() {
+  const box = $("#persons");
+  box.innerHTML = "";
+  state.persons.forEach((pid, i) => {
+    const label = document.createElement("label");
+    label.innerHTML = `
+      <input type="checkbox" value="${pid}">
+      <span>${pid}</span>
+      ${i < 9 ? `<span class="num">${i + 1}</span>` : ""}
+    `;
+    const cb = label.querySelector("input");
+    cb.addEventListener("change", onPersonToggle);
+    box.appendChild(label);
+  });
+}
+
+function onPersonToggle() {
+  const checked = [...document.querySelectorAll("#persons input:checked")].map((x) => x.value);
+  const frame = state.frame;
+  const existing = findKf(frame);
+  if (checked.length === 0) {
+    state.keyframes = state.keyframes.filter((k) => k.frame !== frame);
+  } else if (existing) {
+    existing.person_ids = checked;
+    existing.updated_at = new Date().toISOString();
+  } else {
+    state.keyframes.push({
+      frame, person_ids: checked,
+      updated_at: new Date().toISOString(),
+    });
+    state.keyframes.sort((a, b) => a.frame - b.frame);
+  }
+  refreshKfUI();
+  renderKfList();
+  scheduleSave();
+}
+
+function scheduleSave() {
+  setStatus("修改中…", "saving");
+  clearTimeout(state.saveTimer);
+  state.saveTimer = setTimeout(saveNow, 200);
+}
+
+async function saveNow() {
+  try {
+    setStatus("保存中…", "saving");
+    const data = await jpost(`/api/annotations/${encName(state.current)}`, {
+      keyframes: state.keyframes,
+    });
+    state.keyframes = data.keyframes;
+    setStatus("已保存", "saved");
+  } catch (e) {
+    setStatus("保存失败: " + e.message, "error");
+  }
+}
+
+function prefetch(frame) {
+  if (frame < 0 || frame >= state.total) return;
+  const img = new Image();
+  img.src = frameUrl(frame);
+}
+
+function frameUrl(frame) {
+  return `/api/video/${encName(state.current)}/frame/${frame}`;
+}
+
+function goto(frame) {
+  frame = Math.max(0, Math.min(state.total - 1, frame));
+  state.frame = frame;
+  $("#cur-frame").textContent = frame;
+  $("#frame-img").src = frameUrl(frame);
+  refreshKfUI();
+  renderKfList();
+  prefetch(frame + 1);
+  prefetch(frame - 1);
+}
+
+async function loadVideo(name) {
+  state.current = name;
+  localStorage.setItem(VIDEO_KEY, name);
+  const meta = state.videos.find((v) => v.name === name);
+  state.total = meta.frame_count;
+  state.fps = meta.fps;
+  $("#total-frame").textContent = state.total;
+  $("#jump-input").max = state.total - 1;
+  const anno = await jget(`/api/annotations/${encName(name)}`);
+  state.keyframes = anno.keyframes || [];
+  goto(0);
+  setStatus(`已加载 ${name} (${state.total} 帧, ${state.fps.toFixed(1)} fps)`, "saved");
+}
+
+function collectDirs() {
+  const set = new Set();
+  for (const v of state.videos) set.add(v.dir);
+  return [...set].sort();
+}
+
+function renderDirSelect() {
+  const dirs = collectDirs();
+  const sel = $("#dir-select");
+  const opts = [`<option value="${ALL_DIRS}">(全部)</option>`];
+  for (const d of dirs) {
+    const label = d === "" ? "(根目录)" : d + "/";
+    opts.push(`<option value="${d}">${label}</option>`);
+  }
+  sel.innerHTML = opts.join("");
+  sel.value = state.dir;
+}
+
+// Prefix-match filter: "alice" matches "alice/x.mp4" and "alice/sub/y.mp4".
+function videosInDir(dir) {
+  if (dir === ALL_DIRS) return state.videos;
+  if (dir === "") return state.videos.filter((v) => v.dir === "");
+  return state.videos.filter((v) => v.dir === dir || v.dir.startsWith(dir + "/"));
+}
+
+function renderVideoSelect() {
+  const list = videosInDir(state.dir);
+  const sel = $("#video-select");
+  if (list.length === 0) {
+    sel.innerHTML = '<option value="">(无视频)</option>';
+    return;
+  }
+  // Trim selected dir prefix from labels to reduce visual noise.
+  sel.innerHTML = list.map((v) => {
+    let label = v.name;
+    if (state.dir !== ALL_DIRS && state.dir !== "") {
+      label = v.name.slice(state.dir.length + 1);
+    }
+    return `<option value="${v.name}">${label}</option>`;
+  }).join("");
+}
+
+async function onDirChange(dir) {
+  state.dir = dir;
+  localStorage.setItem(DIR_KEY, dir);
+  renderVideoSelect();
+  const list = videosInDir(dir);
+  if (list.length > 0) {
+    $("#video-select").value = list[0].name;
+    await loadVideo(list[0].name);
+  } else {
+    setStatus("该目录下没有视频", "error");
+  }
+}
+
+function bindControls() {
+  document.querySelectorAll(".controls button[data-step]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const s = btn.dataset.step;
+      if (s === "first") goto(0);
+      else if (s === "last") goto(state.total - 1);
+      else goto(state.frame + parseInt(s, 10));
+    });
+  });
+  $("#jump-btn").addEventListener("click", () => {
+    const v = parseInt($("#jump-input").value, 10);
+    if (!isNaN(v)) goto(v);
+  });
+  $("#jump-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") $("#jump-btn").click();
+  });
+  $("#video-select").addEventListener("change", (e) => loadVideo(e.target.value));
+  $("#dir-select").addEventListener("change", (e) => onDirChange(e.target.value));
+
+  document.addEventListener("keydown", (e) => {
+    const tag = (e.target.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "select" || tag === "textarea") return;
+    const mult = e.ctrlKey || e.metaKey ? 10 : e.shiftKey ? 5 : 1;
+    if (e.key === "ArrowLeft") { e.preventDefault(); goto(state.frame - mult); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); goto(state.frame + mult); }
+    else if (e.key === "Home") { e.preventDefault(); goto(0); }
+    else if (e.key === "End") { e.preventDefault(); goto(state.total - 1); }
+    else if (e.key === "Escape") {
+      e.preventDefault();
+      document.querySelectorAll("#persons input:checked").forEach((cb) => cb.checked = false);
+      onPersonToggle();
+    } else if (/^[1-9]$/.test(e.key)) {
+      const idx = parseInt(e.key, 10) - 1;
+      const cbs = document.querySelectorAll("#persons input[type=checkbox]");
+      if (idx < cbs.length) {
+        e.preventDefault();
+        cbs[idx].checked = !cbs[idx].checked;
+        onPersonToggle();
+      }
+    }
+  });
+}
+
+async function init() {
+  const [videos, persons] = await Promise.all([
+    jget("/api/videos"),
+    jget("/api/persons"),
+  ]);
+  state.videos = videos;
+  state.persons = persons.person_ids || [];
+  renderPersons();
+  bindControls();
+  if (videos.length === 0) {
+    $("#dir-select").innerHTML = '<option>(无)</option>';
+    $("#video-select").innerHTML = '<option>(无视频)</option>';
+    setStatus("videos/ 目录下没有视频文件", "error");
+    return;
+  }
+
+  // Restore prior dir selection if it still has videos available.
+  const savedDir = localStorage.getItem(DIR_KEY);
+  const dirs = new Set(["", ...videos.map((v) => v.dir)]);
+  state.dir = (savedDir === ALL_DIRS || (savedDir !== null && dirs.has(savedDir)))
+    ? savedDir : ALL_DIRS;
+  renderDirSelect();
+  renderVideoSelect();
+
+  // Restore prior video selection if it's in the current filtered list.
+  const visible = videosInDir(state.dir);
+  const savedVideo = localStorage.getItem(VIDEO_KEY);
+  const target = visible.find((v) => v.name === savedVideo) || visible[0];
+  $("#video-select").value = target.name;
+  await loadVideo(target.name);
+}
+
+init().catch((e) => {
+  console.error(e);
+  setStatus("初始化失败: " + e.message, "error");
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+# Ignore annotations and videos data
+annotations/
+videos/
+
+# macOS
+.DS_Store
