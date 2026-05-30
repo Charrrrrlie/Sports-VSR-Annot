@@ -192,7 +192,7 @@
         <kbd>Shift</kbd>+方向 ±5,
         <kbd>Ctrl</kbd>+方向 ±10,
         <kbd>Home</kbd>/<kbd>End</kbd> 首尾,
-        <kbd>1</kbd>-<kbd>9</kbd> 切换ID,
+        <kbd>0</kbd>-<kbd>9</kbd> 选择对应ID,
         <kbd>Esc</kbd> 清空所有勾选
       </div>
     </div>
@@ -217,6 +217,7 @@ const state = {
   frame: 0,             // current frame index
   persons: [],          // global person id list
   keyframes: [],        // [{frame, person_ids, updated_at}]
+  annotated: new Set(), // videos that have annotations
   saveTimer: null,
 };
 
@@ -260,9 +261,11 @@ function refreshKfUI() {
   const kf = findKf(state.frame);
   document.body.classList.toggle("keyframe", !!kf);
   // sync checkboxes
-  const ids = kf ? new Set(kf.person_ids) : new Set();
+  const selected = kf && kf.person_ids && kf.person_ids.length > 0
+    ? String(kf.person_ids[0])
+    : null;
   for (const cb of document.querySelectorAll("#persons input[type=checkbox]")) {
-    cb.checked = ids.has(cb.value);
+    cb.checked = selected ? cb.value === selected : false;
   }
 }
 
@@ -275,12 +278,13 @@ function renderKfList() {
   }
   list.innerHTML = "";
   for (const kf of state.keyframes) {
+    const showId = (kf.person_ids && kf.person_ids.length > 0) ? kf.person_ids[0] : "";
     const li = document.createElement("li");
     if (kf.frame === state.frame) li.className = "current";
     li.innerHTML = `
       <span class="arrow"></span>
       <span class="frame-no">${kf.frame}</span>
-      <span class="ids" title="${kf.person_ids.join(", ")}">${kf.person_ids.join(", ")}</span>
+      <span class="ids" title="${showId}">${showId}</span>
       <button class="del" title="删除">×</button>
     `;
     li.addEventListener("click", (e) => {
@@ -290,6 +294,9 @@ function renderKfList() {
     li.querySelector(".del").addEventListener("click", (e) => {
       e.stopPropagation();
       state.keyframes = state.keyframes.filter((k) => k.frame !== kf.frame);
+      if (state.keyframes.length > 0) state.annotated.add(state.current);
+      else state.annotated.delete(state.current);
+      renderVideoSelect();
       renderKfList();
       if (kf.frame === state.frame) refreshKfUI();
       scheduleSave();
@@ -302,11 +309,13 @@ function renderPersons() {
   const box = $("#persons");
   box.innerHTML = "";
   state.persons.forEach((pid, i) => {
+    const m = String(pid).match(/^p([0-9])$/i);
+    const numKey = m ? m[1] : "";
     const label = document.createElement("label");
     label.innerHTML = `
       <input type="checkbox" value="${pid}">
       <span>${pid}</span>
-      ${i < 9 ? `<span class="num">${i + 1}</span>` : ""}
+      ${numKey ? `<span class="num">${numKey}</span>` : ""}
     `;
     const cb = label.querySelector("input");
     cb.addEventListener("change", onPersonToggle);
@@ -314,25 +323,52 @@ function renderPersons() {
   });
 }
 
-function onPersonToggle() {
-  const checked = [...document.querySelectorAll("#persons input:checked")].map((x) => x.value);
+function updateKeyframeSelection(selectedId) {
   const frame = state.frame;
   const existing = findKf(frame);
-  if (checked.length === 0) {
+  if (!selectedId) {
     state.keyframes = state.keyframes.filter((k) => k.frame !== frame);
   } else if (existing) {
-    existing.person_ids = checked;
+    existing.person_ids = [selectedId];
     existing.updated_at = new Date().toISOString();
   } else {
     state.keyframes.push({
-      frame, person_ids: checked,
+      frame,
+      person_ids: [selectedId],
       updated_at: new Date().toISOString(),
     });
     state.keyframes.sort((a, b) => a.frame - b.frame);
   }
+  if (state.keyframes.length > 0) state.annotated.add(state.current);
+  else state.annotated.delete(state.current);
+  renderVideoSelect();
   refreshKfUI();
   renderKfList();
   scheduleSave();
+}
+
+function onPersonToggle(e) {
+  const cbs = [...document.querySelectorAll("#persons input[type=checkbox]")];
+  const target = e && e.target ? e.target : null;
+  if (target && target.checked) {
+    cbs.forEach((cb) => { if (cb !== target) cb.checked = false; });
+    updateKeyframeSelection(target.value);
+    return;
+  }
+  const checked = cbs.filter((cb) => cb.checked);
+  if (checked.length > 1) {
+    checked.slice(1).forEach((cb) => { cb.checked = false; });
+  }
+  updateKeyframeSelection(checked[0] ? checked[0].value : null);
+}
+
+function togglePersonById(id) {
+  const cb = document.querySelector(`#persons input[type=checkbox][value="${CSS.escape(String(id))}"]`);
+  if (!cb) return;
+  const wasChecked = cb.checked;
+  document.querySelectorAll("#persons input[type=checkbox]").forEach((x) => { x.checked = false; });
+  if (!wasChecked) cb.checked = true;
+  updateKeyframeSelection(cb.checked ? cb.value : null);
 }
 
 function scheduleSave() {
@@ -348,6 +384,9 @@ async function saveNow() {
       keyframes: state.keyframes,
     });
     state.keyframes = data.keyframes;
+    if (state.keyframes.length > 0) state.annotated.add(state.current);
+    else state.annotated.delete(state.current);
+    renderVideoSelect();
     setStatus("已保存", "saved");
   } catch (e) {
     setStatus("保存失败: " + e.message, "error");
@@ -384,7 +423,13 @@ async function loadVideo(name) {
   $("#total-frame").textContent = state.total;
   $("#jump-input").max = state.total - 1;
   const anno = await jget(`/api/annotations/${encName(name)}`);
-  state.keyframes = anno.keyframes || [];
+  state.keyframes = (anno.keyframes || []).map((k) => {
+    const id = k.person_ids && k.person_ids.length > 0 ? String(k.person_ids[0]) : null;
+    return id ? { ...k, person_ids: [id] } : null;
+  }).filter(Boolean);
+  if (state.keyframes.length > 0) state.annotated.add(name);
+  else state.annotated.delete(name);
+  renderVideoSelect();
   goto(0);
   setStatus(`已加载 ${name} (${state.total} 帧, ${state.fps.toFixed(1)} fps)`, "saved");
 }
@@ -427,7 +472,8 @@ function renderVideoSelect() {
     if (state.dir !== ALL_DIRS && state.dir !== "") {
       label = v.name.slice(state.dir.length + 1);
     }
-    return `<option value="${v.name}">${label}</option>`;
+    const mark = state.annotated.has(v.name) ? " ★" : "";
+    return `<option value="${v.name}">${label}${mark}</option>`;
   }).join("");
 }
 
@@ -474,15 +520,10 @@ function bindControls() {
     else if (e.key === "Escape") {
       e.preventDefault();
       document.querySelectorAll("#persons input:checked").forEach((cb) => cb.checked = false);
-      onPersonToggle();
-    } else if (/^[1-9]$/.test(e.key)) {
-      const idx = parseInt(e.key, 10) - 1;
-      const cbs = document.querySelectorAll("#persons input[type=checkbox]");
-      if (idx < cbs.length) {
-        e.preventDefault();
-        cbs[idx].checked = !cbs[idx].checked;
-        onPersonToggle();
-      }
+      updateKeyframeSelection(null);
+    } else if (/^[0-9]$/.test(e.key)) {
+      e.preventDefault();
+      togglePersonById(`p${e.key}`);
     }
   });
 }
@@ -494,6 +535,12 @@ async function init() {
   ]);
   state.videos = videos;
   state.persons = persons.person_ids || [];
+  try {
+    const annotated = await jget("/api/annotated");
+    state.annotated = new Set(annotated.annotated || []);
+  } catch (e) {
+    state.annotated = new Set();
+  }
   renderPersons();
   bindControls();
   if (videos.length === 0) {

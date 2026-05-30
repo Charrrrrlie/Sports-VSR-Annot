@@ -111,6 +111,28 @@ def load_persons():
         return json.load(f).get("person_ids", [])
 
 
+def list_annotated_videos() -> list[str]:
+    annotated: list[str] = []
+    for p in ANNO_DIR.rglob("*.json"):
+        if not p.is_file():
+            continue
+        try:
+            rel = p.relative_to(ANNO_DIR).as_posix()
+        except ValueError:
+            continue
+        video_name = rel[:-5] if rel.endswith(".json") else rel
+        if video_name not in VIDEOS:
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("keyframes"):
+                annotated.append(video_name)
+        except Exception:
+            continue
+    return annotated
+
+
 def anno_path(video_name: str) -> Path:
     p = (ANNO_DIR / f"{video_name}.json").resolve()
     anno_root = ANNO_DIR.resolve()
@@ -253,6 +275,12 @@ def api_frame(name, idx):
 @require_auth
 def api_persons():
     return jsonify({"person_ids": load_persons()})
+
+
+@app.route("/api/annotated")
+@require_auth
+def api_annotated():
+    return jsonify({"annotated": list_annotated_videos()})
 
 
 @app.route("/api/annotations/<path:name>", methods=["GET", "POST"])
