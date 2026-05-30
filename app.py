@@ -80,10 +80,20 @@ class VideoHandle:
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+    def release(self):
+        with self.lock:
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+
     def read_frame(self, idx: int):
         if idx < 0 or idx >= self.frame_count:
             return None
         with self.lock:
+            if not self.cap:
+                self.cap = cv2.VideoCapture(str(self.path))
+                if not self.cap.isOpened():
+                    return None
             cur = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
             if cur != idx:
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -96,18 +106,46 @@ class VideoHandle:
         return buf.tobytes()
 
 
-VIDEOS: dict[str, VideoHandle] = {}
+VIDEOS: dict[str, Path] = {}
+VIDEO_META: dict[str, dict] = {}
+HANDLE_CACHE: "OrderedDict[str, VideoHandle]" = OrderedDict()
+HANDLE_LOCK = threading.Lock()
+HANDLE_MAX = int(CONFIG.get("video_handle_lru_size", 4))
+
+
+def probe_video_meta(path: Path) -> dict | None:
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        cap.release()
+        return None
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    meta = {
+        "frame_count": frame_count,
+        "fps": float(fps) if fps and fps > 0 else 0.0,
+        "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+    }
+    cap.release()
+    return meta
 
 
 def scan_videos():
     VIDEOS.clear()
+    VIDEO_META.clear()
+    with HANDLE_LOCK:
+        for _name, h in HANDLE_CACHE.items():
+            h.release()
+        HANDLE_CACHE.clear()
     for p in sorted(VIDEO_DIR.rglob("*")):
         if p.is_file() and p.suffix.lower() in VIDEO_EXTS:
             rel = p.relative_to(VIDEO_DIR).as_posix()
-            try:
-                VIDEOS[rel] = VideoHandle(p)
-            except Exception as e:
-                print(f"[scan] skip {rel}: {e}")
+            meta = probe_video_meta(p)
+            if not meta:
+                print(f"[scan] skip {rel}: cannot open")
+                continue
+            VIDEOS[rel] = p
+            VIDEO_META[rel] = meta
     print(f"[scan] loaded {len(VIDEOS)} videos: {list(VIDEOS)}")
 
 
@@ -136,6 +174,36 @@ class FrameLRU:
 
 
 FRAME_CACHE = FrameLRU(maxsize=int(CONFIG.get("lru_size", 256)))
+
+
+def get_video_meta(name: str) -> dict:
+    if name in VIDEO_META:
+        return VIDEO_META[name]
+    path = VIDEOS.get(name)
+    if not path:
+        raise KeyError(name)
+    meta = probe_video_meta(path)
+    if not meta:
+        raise RuntimeError(f"cannot open video {path}")
+    VIDEO_META[name] = meta
+    return meta
+
+
+def get_video_handle(name: str) -> VideoHandle:
+    with HANDLE_LOCK:
+        if name in HANDLE_CACHE:
+            HANDLE_CACHE.move_to_end(name)
+            return HANDLE_CACHE[name]
+        path = VIDEOS.get(name)
+        if not path:
+            raise KeyError(name)
+        h = VideoHandle(path)
+        HANDLE_CACHE[name] = h
+        HANDLE_CACHE.move_to_end(name)
+        while len(HANDLE_CACHE) > HANDLE_MAX:
+            _, old = HANDLE_CACHE.popitem(last=False)
+            old.release()
+        return h
 
 
 def load_persons():
@@ -175,11 +243,11 @@ def anno_path(video_name: str) -> Path:
 
 
 def empty_anno(video_name: str) -> dict:
-    h = VIDEOS[video_name]
+    h = get_video_meta(video_name)
     return {
         "video": video_name,
-        "fps": h.fps,
-        "frame_count": h.frame_count,
+        "fps": h["fps"],
+        "frame_count": h["frame_count"],
         "keyframes": [],
     }
 
@@ -190,9 +258,10 @@ def load_anno(video_name: str) -> dict:
         return empty_anno(video_name)
     with open(p, "r", encoding="utf-8") as f:
         data = json.load(f)
+    meta = get_video_meta(video_name)
     data.setdefault("video", video_name)
-    data.setdefault("fps", VIDEOS[video_name].fps)
-    data.setdefault("frame_count", VIDEOS[video_name].frame_count)
+    data.setdefault("fps", meta["fps"])
+    data.setdefault("frame_count", meta["frame_count"])
     data.setdefault("keyframes", [])
     return data
 
@@ -272,18 +341,20 @@ def index():
 def api_videos():
     def dir_of(name: str) -> str:
         return name.rsplit("/", 1)[0] if "/" in name else ""
-    return jsonify([
-        {
+    items = []
+    for name in VIDEOS.keys():
+        try:
+            meta = get_video_meta(name)
+        except Exception as e:
+            print(f"[videos] skip {name}: {e}")
+            continue
+        items.append({
             "name": name,
             "dir": dir_of(name),
             "basename": name.rsplit("/", 1)[-1],
-            "frame_count": h.frame_count,
-            "fps": h.fps,
-            "width": h.width,
-            "height": h.height,
-        }
-        for name, h in VIDEOS.items()
-    ])
+            **meta,
+        })
+    return jsonify(items)
 
 
 @app.route("/api/video/<path:name>/frame/<int:idx>")
@@ -294,7 +365,7 @@ def api_frame(name, idx):
     key = (name, idx)
     data = FRAME_CACHE.get(key)
     if data is None:
-        data = VIDEOS[name].read_frame(idx)
+        data = get_video_handle(name).read_frame(idx)
         if data is None:
             abort(404)
         FRAME_CACHE.put(key, data)
@@ -326,7 +397,7 @@ def api_annotations(name):
     keyframes = payload.get("keyframes", [])
     cleaned = []
     seen = set()
-    fc = VIDEOS[name].frame_count
+    fc = get_video_meta(name)["frame_count"]
     for kf in keyframes:
         try:
             f = int(kf["frame"])

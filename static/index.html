@@ -154,6 +154,7 @@
     <select id="video-select"></select>
   </label>
   <span id="counter">Frame <b id="cur-frame">0</b> / <span id="total-frame">0</span></span>
+  <span id="dir-count"></span>
   <span id="kf-badge">★ KEYFRAME</span>
   <span class="spacer"></span>
   <span id="status"></span>
@@ -435,8 +436,16 @@ async function loadVideo(name) {
 }
 
 function collectDirs() {
-  const set = new Set();
-  for (const v of state.videos) set.add(v.dir);
+  const set = new Set([""]);
+  for (const v of state.videos) {
+    const dir = v.dir || "";
+    if (!dir) continue;
+    const parts = dir.split("/").filter(Boolean);
+    const maxDepth = Math.min(3, parts.length);
+    for (let i = 1; i <= maxDepth; i++) {
+      set.add(parts.slice(0, i).join("/"));
+    }
+  }
   return [...set].sort();
 }
 
@@ -462,6 +471,7 @@ function videosInDir(dir) {
 function renderVideoSelect() {
   const list = videosInDir(state.dir);
   const sel = $("#video-select");
+  $("#dir-count").textContent = `| Video Num ${list.length}`;
   if (list.length === 0) {
     sel.innerHTML = '<option value="">(无视频)</option>';
     return;
@@ -552,7 +562,7 @@ async function init() {
 
   // Restore prior dir selection if it still has videos available.
   const savedDir = localStorage.getItem(DIR_KEY);
-  const dirs = new Set(["", ...videos.map((v) => v.dir)]);
+  const dirs = new Set(collectDirs());
   state.dir = (savedDir === ALL_DIRS || (savedDir !== null && dirs.has(savedDir)))
     ? savedDir : ALL_DIRS;
   renderDirSelect();
