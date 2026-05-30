@@ -2,6 +2,7 @@ import json
 import os
 import signal
 import threading
+import sys
 from collections import OrderedDict
 from datetime import datetime
 from functools import wraps
@@ -13,20 +14,51 @@ from flask import (Flask, Response, abort, jsonify, redirect, request,
 
 BASE_DIR = Path(__file__).resolve().parent
 VIDEO_DIR = BASE_DIR / "videos"
-ANNO_DIR = BASE_DIR / "annotations"
 STATIC_DIR = BASE_DIR / "static"
-CONFIG_PATH = BASE_DIR / "config.json"
+CONFIG_PATH_DEFAULT = BASE_DIR / "config.json"
 PERSONS_PATH = BASE_DIR / "persons.json"
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
 VIDEO_DIR.mkdir(exist_ok=True)
-ANNO_DIR.mkdir(exist_ok=True)
 STATIC_DIR.mkdir(exist_ok=True)
 
 
+def resolve_path(value: str | None, base: Path) -> Path:
+    if not value:
+        return base
+    p = Path(value)
+    return p if p.is_absolute() else base / p
+
+
+def get_config_path(argv: list[str]) -> str | None:
+    if "--config" in argv:
+        i = argv.index("--config")
+        if i + 1 < len(argv):
+            return argv[i + 1]
+    if "-c" in argv:
+        i = argv.index("-c")
+        if i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+
+CONFIG_PATH = resolve_path(
+    os.getenv("CONFIG_PATH") or get_config_path(sys.argv[1:]) or str(CONFIG_PATH_DEFAULT),
+    BASE_DIR,
+)
+
 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     CONFIG = json.load(f)
+
+
+GROUP = os.getenv("ANNOT_GROUP") or CONFIG.get("group") or "default"
+ANNO_ROOT = os.getenv("ANNO_ROOT") or CONFIG.get("anno_root") or "annotations"
+ANNO_DIR = resolve_path(ANNO_ROOT, BASE_DIR) / GROUP
+ANNO_DIR.mkdir(parents=True, exist_ok=True)
+
+HOST = os.getenv("HOST") or CONFIG.get("host", "127.0.0.1")
+PORT = int(os.getenv("PORT") or CONFIG.get("port", 5000))
 
 
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
@@ -334,5 +366,5 @@ def _force_exit(_sig, _frm):
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, _force_exit)
     signal.signal(signal.SIGTERM, _force_exit)
-    print(f"[start] http://{CONFIG['host']}:{CONFIG['port']}")
-    app.run(host=CONFIG["host"], port=CONFIG["port"], threaded=True, debug=False)
+    print(f"[start] http://{HOST}:{PORT} (group={GROUP}, anno_dir={ANNO_DIR})")
+    app.run(host=HOST, port=PORT, threaded=True, debug=False)

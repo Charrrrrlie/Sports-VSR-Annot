@@ -49,6 +49,15 @@ python3 app.py
 
 默认监听 `0.0.0.0:5009`。浏览器打开 **http://localhost:5009** 或 **http://<本机IP>:5009**，输入密码即可。
 
+如果需要**同时运行多个实例**（不同小组/不同端口/不同标注目录），可以指定不同的配置文件：
+
+```bash
+python3 app.py --config config.teamA.json
+python3 app.py --config config.teamB.json
+```
+
+也支持环境变量：`CONFIG_PATH=/path/to/config.teamA.json python3 app.py`
+
 > macOS 用户：5000 端口被 AirPlay Receiver 占用，默认改为 5009。如需 5000 请先在 *系统设置 → 通用 → AirDrop 与接力 → AirPlay 接收器* 关闭。
 
 ## 使用流程
@@ -95,6 +104,8 @@ videos/
   "password": "your-strong-password",
   "host": "0.0.0.0",
   "port": 5009,
+  "group": "A",
+  "anno_root": "annotations",
   "lru_size": 256,
   "secret_key": "random-string-for-session-cookie"
 }
@@ -103,6 +114,8 @@ videos/
 - `password`：登录密码
 - `host`：`0.0.0.0` 允许局域网访问，`127.0.0.1` 仅本机
 - `port`：服务端口
+- `group`：小组名（用于把标注保存到 `anno_root/<group>/`）
+- `anno_root`：标注根目录（相对或绝对路径）
 - `lru_size`：帧缓存大小（单位：帧），256 帧约占 50-200MB 内存
 - `secret_key`：Flask session 签名密钥，**生产环境请改成随机字符串**
 
