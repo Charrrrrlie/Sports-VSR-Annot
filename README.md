@@ -11,6 +11,7 @@
 - **共享密码**：单一密码登录（Flask session）
 - **按需解码**：OpenCV seek + 内存 LRU 缓存，无预处理开销
 - **零前端框架**：单文件 HTML + 原生 JS
+- **离线扫描**：OSS 扫描与标注运行分离，运行时不需要 AK/SK
 
 ## 技术栈
 
@@ -24,10 +25,12 @@
 annotation/
 ├── app.py              # Flask 服务（单文件后端）
 ├── requirements.txt    # flask, opencv-python
+├── scan_oss.py          # OSS 扫描脚本（生成 video_index.json）
 ├── config.json         # 密码、端口、缓存大小
 ├── persons.json        # 全局预定义 person ID 列表
 ├── videos/             # 输入：把视频拷进这里
 ├── annotations/        # 输出：每个视频一个 JSON
+├── video_index.json     # 远程索引（扫描脚本生成）
 └── static/
     └── index.html      # 单页前端
 ```
@@ -60,6 +63,24 @@ python3 app.py --config config.teamB.json
 
 > macOS 用户：5000 端口被 AirPlay Receiver 占用，默认改为 5009。如需 5000 请先在 *系统设置 → 通用 → AirDrop 与接力 → AirPlay 接收器* 关闭。
 
+## Windows 打包为 EXE
+
+在 Windows 机器上执行（建议用 Python 3.9+）：
+
+1. 安装依赖：
+
+```bash
+pip install -r requirements.txt -r requirements-build.txt
+```
+
+2. 生成 EXE：
+
+```bash
+build_windows.bat
+```
+
+完成后在 `dist/VSR-annotation/` 中得到可运行目录。把该目录复制到目标机器，保持 `videos/` 与 `annotations/` 放在 exe 同级（不建议打包进 exe，体积过大且不便更新）。
+
 ## 使用流程
 
 ### 1. 准备视频
@@ -82,6 +103,45 @@ videos/
 页面顶栏会出现"目录"下拉框，可按目录筛选视频，方便分工：每个人选择自己负责的目录即可（前缀匹配，选 `alice/` 会同时显示 `alice/clip_a.mp4` 和 `alice/nested/deep.mp4`）。选择会通过 localStorage 记住，下次打开自动恢复。
 
 标注 JSON 也会按相同的目录结构镜像保存到 `annotations/alice/nested/deep.mp4.json`，便于按目录归档或单独打包发送。
+
+### 1b. 远程 OSS（扫描与标注分离）
+
+**扫描阶段（仅此阶段需要 AK/SK）：**
+
+用 `scan_oss.py` 生成 `video_index.json`（可选设置公开读）。生成后，标注服务**不再需要 AK/SK**。
+
+示例：
+
+```bash
+python3 scan_oss.py \
+  --endpoint https://oss-cn-shanghai.aliyuncs.com \
+  --bucket ai4sports-shanghai \
+  --prefix ai4sports-shanghai/VSR/test \
+  --ak <AK> \
+  --sk <SK> \
+  --public-read \
+  --out video_index.json
+```
+
+可选 `--probe-meta` 以提前写入 `frame_count/fps/width/height`（会慢一些）。
+
+**标注阶段（不需要 AK/SK）：**
+
+在 `config.json` 或环境变量中设置：
+
+```json
+{
+  "video_source": "oss",
+  "video_index_path": "video_index.json"
+}
+```
+
+或使用环境变量：
+
+```
+VIDEO_SOURCE=oss
+VIDEO_INDEX_PATH=video_index.json
+```
 
 ### 2. 配置 Person ID
 
@@ -118,6 +178,8 @@ videos/
 - `anno_root`：标注根目录（相对或绝对路径）
 - `lru_size`：帧缓存大小（单位：帧），256 帧约占 50-200MB 内存
 - `secret_key`：Flask session 签名密钥，**生产环境请改成随机字符串**
+- `video_source`：`local`（本地视频）或 `oss`（读取 video_index.json）
+- `video_index_path`：远程索引 JSON 的路径
 
 ### 4. 浏览器标注
 
@@ -192,6 +254,7 @@ videos/
 | GET  | `/logout`                           | 清除 session               |
 | GET  | `/api/videos`                       | 视频列表与元数据           |
 | GET  | `/api/video/<name>/frame/<n>`       | 第 n 帧 JPEG               |
+| GET  | `/api/video/<name>/meta`            | 单个视频元数据（按需）     |
 | GET  | `/api/persons`                      | 预定义 person ID 列表      |
 | GET  | `/api/annotations/<name>`           | 读取标注                   |
 | POST | `/api/annotations/<name>`           | 整体覆盖写入标注           |

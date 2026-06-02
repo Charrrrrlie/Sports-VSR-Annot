@@ -5,5 +5,7 @@
   "group": "default",
   "anno_root": "annotations",
   "lru_size": 256,
-  "secret_key": "please-change-this-random-string"
+  "secret_key": "please-change-this-random-string",
+  "video_source": "oss",
+  "video_index_path": "video_index.json"
 }

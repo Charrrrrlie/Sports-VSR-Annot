@@ -12,15 +12,20 @@ import cv2
 from flask import (Flask, Response, abort, jsonify, redirect, request,
                    send_from_directory, session, url_for)
 
+try:
+    import av
+except Exception:
+    av = None
+
 BASE_DIR = Path(__file__).resolve().parent
 VIDEO_DIR = BASE_DIR / "videos"
 STATIC_DIR = BASE_DIR / "static"
 CONFIG_PATH_DEFAULT = BASE_DIR / "config.json"
 PERSONS_PATH = BASE_DIR / "persons.json"
+VIDEO_INDEX_PATH_DEFAULT = BASE_DIR / "video_index.json"
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
-VIDEO_DIR.mkdir(exist_ok=True)
 STATIC_DIR.mkdir(exist_ok=True)
 
 
@@ -52,6 +57,13 @@ with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     CONFIG = json.load(f)
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return bool(default)
+    return str(val).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 GROUP = os.getenv("ANNOT_GROUP") or CONFIG.get("group") or "default"
 ANNO_ROOT = os.getenv("ANNO_ROOT") or CONFIG.get("anno_root") or "annotations"
 ANNO_DIR = resolve_path(ANNO_ROOT, BASE_DIR) / GROUP
@@ -60,44 +72,92 @@ ANNO_DIR.mkdir(parents=True, exist_ok=True)
 HOST = os.getenv("HOST") or CONFIG.get("host", "127.0.0.1")
 PORT = int(os.getenv("PORT") or CONFIG.get("port", 5000))
 
+VIDEO_SOURCE = (os.getenv("VIDEO_SOURCE") or CONFIG.get("video_source") or "oss").strip().lower()
+VIDEO_INDEX_PATH = resolve_path(
+    os.getenv("VIDEO_INDEX_PATH") or CONFIG.get("video_index_path") or str(VIDEO_INDEX_PATH_DEFAULT),
+    BASE_DIR,
+)
+REMOTE_FORWARD_MAX = int(os.getenv("REMOTE_FORWARD_MAX") or CONFIG.get("remote_forward_max", 8))
+
 
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
 app.secret_key = CONFIG.get("secret_key", "dev-secret")
 
 
+def is_remote_source(source: str) -> bool:
+    return source.startswith("http://") or source.startswith("https://")
+
+
 class VideoHandle:
     """Holds one cv2.VideoCapture + a lock; OpenCV is not thread-safe."""
 
-    def __init__(self, path: Path):
-        self.path = path
+    def __init__(self, source: str, meta: dict | None = None):
+        self.source = source
         self.lock = threading.Lock()
-        self.cap = cv2.VideoCapture(str(path))
-        if not self.cap.isOpened():
-            raise RuntimeError(f"cannot open video {path}")
-        self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = self.cap.get(cv2.CAP_PROP_FPS)
-        self.fps = float(fps) if fps and fps > 0 else 0.0
-        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.backend = "av" if is_remote_source(source) else "cv2"
+        self.cap = None
+        self.container = None
+        self.stream = None
+        self._av_next_idx = None
+
+        if self.backend == "cv2":
+            self.cap = cv2.VideoCapture(source)
+            if not self.cap.isOpened():
+                raise RuntimeError(f"cannot open video {source}")
+            self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = self.cap.get(cv2.CAP_PROP_FPS)
+            self.fps = float(fps) if fps and fps > 0 else 0.0
+            self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            return
+
+        if av is None:
+            raise RuntimeError("PyAV is required to read remote URLs (pip install av)")
+
+        self.container = av.open(source)
+        self.stream = next((s for s in self.container.streams if s.type == "video"), None)
+        if not self.stream:
+            raise RuntimeError(f"cannot open video stream {source}")
+        self.width = int(self.stream.width or 0)
+        self.height = int(self.stream.height or 0)
+        self.fps = float(self.stream.average_rate) if self.stream.average_rate else 0.0
+        if meta:
+            self.frame_count = int(meta.get("frame_count") or 0)
+            self.fps = float(meta.get("fps") or self.fps or 0.0)
+            if meta.get("width"):
+                self.width = int(meta.get("width"))
+            if meta.get("height"):
+                self.height = int(meta.get("height"))
+        else:
+            self.frame_count = int(self.stream.frames or 0)
+            if self.frame_count <= 0 and self.stream.duration and self.fps:
+                seconds = float(self.stream.duration * self.stream.time_base)
+                self.frame_count = int(seconds * self.fps)
 
     def release(self):
         with self.lock:
-            if self.cap:
+            if self.backend == "cv2" and self.cap:
                 self.cap.release()
                 self.cap = None
+            if self.backend == "av" and self.container:
+                try:
+                    self.container.close()
+                finally:
+                    self.container = None
+                    self.stream = None
+                    self._av_next_idx = None
 
-    def read_frame(self, idx: int):
+    def _read_frame_cv2(self, idx: int):
         if idx < 0 or idx >= self.frame_count:
             return None
-        with self.lock:
-            if not self.cap:
-                self.cap = cv2.VideoCapture(str(self.path))
-                if not self.cap.isOpened():
-                    return None
-            cur = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-            if cur != idx:
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ok, frame = self.cap.read()
+        if not self.cap:
+            self.cap = cv2.VideoCapture(self.source)
+            if not self.cap.isOpened():
+                return None
+        cur = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+        if cur != idx:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = self.cap.read()
         if not ok or frame is None:
             return None
         ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
@@ -105,16 +165,87 @@ class VideoHandle:
             return None
         return buf.tobytes()
 
+    def _read_frame_av(self, idx: int):
+        if self.fps <= 0:
+            return None
+        if not self.container or not self.stream:
+            self.container = av.open(self.source)
+            self.stream = next((s for s in self.container.streams if s.type == "video"), None)
+            if not self.stream:
+                return None
 
-VIDEOS: dict[str, Path] = {}
+        if self._av_next_idx is not None and idx >= self._av_next_idx:
+            gap = idx - self._av_next_idx
+            if gap <= REMOTE_FORWARD_MAX:
+                for frame in self.container.decode(self.stream):
+                    cur_idx = self._av_next_idx
+                    self._av_next_idx += 1
+                    if cur_idx == idx:
+                        img = frame.to_ndarray(format="bgr24")
+                        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                        if not ok:
+                            return None
+                        return buf.tobytes()
+
+        target_seconds = idx / self.fps
+        target_pts = None
+        if self.stream.time_base:
+            target_pts = int(target_seconds / self.stream.time_base)
+            self.container.seek(target_pts, stream=self.stream, any_frame=False, backward=True)
+        else:
+            self.container.seek(int(target_seconds * 1_000_000), stream=self.stream, any_frame=False, backward=True)
+
+        for frame in self.container.decode(self.stream):
+            if target_pts is None or frame.pts is None or frame.pts >= target_pts:
+                img = frame.to_ndarray(format="bgr24")
+                ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                if not ok:
+                    return None
+                self._av_next_idx = idx + 1
+                return buf.tobytes()
+        return None
+
+    def read_frame(self, idx: int):
+        with self.lock:
+            if self.backend == "cv2":
+                return self._read_frame_cv2(idx)
+            return self._read_frame_av(idx)
+
+
+VIDEOS: dict[str, dict] = {}
 VIDEO_META: dict[str, dict] = {}
 HANDLE_CACHE: "OrderedDict[str, VideoHandle]" = OrderedDict()
 HANDLE_LOCK = threading.Lock()
 HANDLE_MAX = int(CONFIG.get("video_handle_lru_size", 4))
 
 
-def probe_video_meta(path: Path) -> dict | None:
-    cap = cv2.VideoCapture(str(path))
+def probe_video_meta(source: str) -> dict | None:
+    if is_remote_source(source):
+        if av is None:
+            return None
+        try:
+            container = av.open(source)
+            stream = next((s for s in container.streams if s.type == "video"), None)
+            if not stream:
+                container.close()
+                return None
+            fps = float(stream.average_rate) if stream.average_rate else 0.0
+            frame_count = int(stream.frames or 0)
+            if frame_count <= 0 and stream.duration and fps:
+                seconds = float(stream.duration * stream.time_base)
+                frame_count = int(seconds * fps)
+            meta = {
+                "frame_count": frame_count,
+                "fps": fps,
+                "width": int(stream.width or 0),
+                "height": int(stream.height or 0),
+            }
+            container.close()
+            return meta
+        except Exception:
+            return None
+
+    cap = cv2.VideoCapture(source)
     if not cap.isOpened():
         cap.release()
         return None
@@ -130,6 +261,48 @@ def probe_video_meta(path: Path) -> dict | None:
     return meta
 
 
+def load_video_index(path: Path) -> list[dict]:
+    if not path.exists():
+        print(f"[scan] video_index not found: {path}")
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[scan] read video_index failed: {e}")
+        return []
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        print("[scan] invalid video_index format")
+        return []
+    return items
+
+
+def scan_local_videos():
+    VIDEO_DIR.mkdir(exist_ok=True)
+    for p in sorted(VIDEO_DIR.rglob("*")):
+        if p.is_file() and p.suffix.lower() in VIDEO_EXTS:
+            rel = p.relative_to(VIDEO_DIR).as_posix()
+            meta = probe_video_meta(str(p))
+            if not meta:
+                print(f"[scan] skip {rel}: cannot open")
+                continue
+            VIDEOS[rel] = {"type": "local", "path": p}
+            VIDEO_META[rel] = meta
+
+
+def scan_index_videos():
+    for item in load_video_index(VIDEO_INDEX_PATH):
+        name = item.get("name")
+        url = item.get("url")
+        if not name or not url:
+            continue
+        VIDEOS.setdefault(name, {"type": "oss", "url": url})
+        meta = {k: item.get(k) for k in ("frame_count", "fps", "width", "height")}
+        if all(v is not None for v in meta.values()):
+            VIDEO_META[name] = meta
+
+
 def scan_videos():
     VIDEOS.clear()
     VIDEO_META.clear()
@@ -137,16 +310,20 @@ def scan_videos():
         for _name, h in HANDLE_CACHE.items():
             h.release()
         HANDLE_CACHE.clear()
-    for p in sorted(VIDEO_DIR.rglob("*")):
-        if p.is_file() and p.suffix.lower() in VIDEO_EXTS:
-            rel = p.relative_to(VIDEO_DIR).as_posix()
-            meta = probe_video_meta(p)
-            if not meta:
-                print(f"[scan] skip {rel}: cannot open")
-                continue
-            VIDEOS[rel] = p
-            VIDEO_META[rel] = meta
-    print(f"[scan] loaded {len(VIDEOS)} videos: {list(VIDEOS)}")
+
+    mode = VIDEO_SOURCE
+    if mode not in {"local", "oss", "index", "remote"}:
+        print(f"[scan] invalid VIDEO_SOURCE={VIDEO_SOURCE}, fallback to local")
+        mode = "local"
+
+    if mode == "local":
+        scan_local_videos()
+    if mode in {"oss", "index", "remote"}:
+        if av is None:
+            raise RuntimeError("Remote mode requires PyAV. Install 'av' before starting.")
+        scan_index_videos()
+
+    print(f"[scan] loaded {len(VIDEOS)} videos (source={mode})")
 
 
 scan_videos()
@@ -179,12 +356,13 @@ FRAME_CACHE = FrameLRU(maxsize=int(CONFIG.get("lru_size", 256)))
 def get_video_meta(name: str) -> dict:
     if name in VIDEO_META:
         return VIDEO_META[name]
-    path = VIDEOS.get(name)
-    if not path:
+    src = VIDEOS.get(name)
+    if not src:
         raise KeyError(name)
-    meta = probe_video_meta(path)
+    source = str(src.get("path")) if src.get("type") == "local" else src.get("url")
+    meta = probe_video_meta(source)
     if not meta:
-        raise RuntimeError(f"cannot open video {path}")
+        raise RuntimeError(f"cannot open video {name}")
     VIDEO_META[name] = meta
     return meta
 
@@ -194,10 +372,11 @@ def get_video_handle(name: str) -> VideoHandle:
         if name in HANDLE_CACHE:
             HANDLE_CACHE.move_to_end(name)
             return HANDLE_CACHE[name]
-        path = VIDEOS.get(name)
-        if not path:
+        src = VIDEOS.get(name)
+        if not src:
             raise KeyError(name)
-        h = VideoHandle(path)
+        source = str(src.get("path")) if src.get("type") == "local" else src.get("url")
+        h = VideoHandle(source, meta=VIDEO_META.get(name))
         HANDLE_CACHE[name] = h
         HANDLE_CACHE.move_to_end(name)
         while len(HANDLE_CACHE) > HANDLE_MAX:
@@ -343,18 +522,27 @@ def api_videos():
         return name.rsplit("/", 1)[0] if "/" in name else ""
     items = []
     for name in VIDEOS.keys():
-        try:
-            meta = get_video_meta(name)
-        except Exception as e:
-            print(f"[videos] skip {name}: {e}")
-            continue
-        items.append({
+        meta = VIDEO_META.get(name)
+        item = {
             "name": name,
             "dir": dir_of(name),
             "basename": name.rsplit("/", 1)[-1],
-            **meta,
-        })
+        }
+        if meta:
+            item.update(meta)
+        items.append(item)
     return jsonify(items)
+
+
+@app.route("/api/video/<path:name>/meta")
+@require_auth
+def api_video_meta(name):
+    if name not in VIDEOS:
+        abort(404)
+    try:
+        return jsonify(get_video_meta(name))
+    except Exception:
+        abort(404)
 
 
 @app.route("/api/video/<path:name>/frame/<int:idx>")

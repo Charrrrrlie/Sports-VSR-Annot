@@ -163,7 +163,7 @@
 
 <main>
   <section class="viewer">
-    <div class="frame-wrap">
+    <div class="frame-wrap" id="frame-wrap" tabindex="-1">
       <div id="kf-overlay">★ KEYFRAME</div>
       <img id="frame-img" alt="">
     </div>
@@ -418,9 +418,15 @@ function goto(frame) {
 async function loadVideo(name) {
   state.current = name;
   localStorage.setItem(VIDEO_KEY, name);
-  const meta = state.videos.find((v) => v.name === name);
-  state.total = meta.frame_count;
-  state.fps = meta.fps;
+  let meta = state.videos.find((v) => v.name === name) || {};
+  if (meta.frame_count == null || meta.fps == null) {
+    const fetched = await jget(`/api/video/${encName(name)}/meta`);
+    meta = { ...meta, ...fetched };
+    const idx = state.videos.findIndex((v) => v.name === name);
+    if (idx >= 0) state.videos[idx] = meta;
+  }
+  state.total = meta.frame_count || 0;
+  state.fps = meta.fps || 0;
   $("#total-frame").textContent = state.total;
   $("#jump-input").max = state.total - 1;
   const anno = await jget(`/api/annotations/${encName(name)}`);
@@ -432,6 +438,8 @@ async function loadVideo(name) {
   else state.annotated.delete(name);
   renderVideoSelect();
   goto(0);
+  const viewer = $("#frame-wrap");
+  if (viewer) viewer.focus();
   setStatus(`已加载 ${name} (${state.total} 帧, ${state.fps.toFixed(1)} fps)`, "saved");
 }
 
@@ -485,6 +493,9 @@ function renderVideoSelect() {
     const mark = state.annotated.has(v.name) ? " ★" : "";
     return `<option value="${v.name}">${label}${mark}</option>`;
   }).join("");
+  if (state.current) {
+    sel.value = state.current;
+  }
 }
 
 async function onDirChange(dir) {
